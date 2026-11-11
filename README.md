@@ -194,3 +194,7 @@ The end-to-end script uses `curl`, `wget`, `sqlite3`, and, when installed, `busy
 - When the far-side wrapper is killed, the script's own shell is stopped (TERM, then KILL after 5 s), but commands that shell had started may run on.
 - Output passes through pipes/files, not a pty, so programs see a non-terminal stdout (no colours, block buffering in some tools).
 - The `wget` on the far side must support `--post-file` and `--header` (GNU wget does; BusyBox wget does when built with long options, which is the usual configuration - tested with BusyBox 1.36.1). Very old BusyBox builds without it cannot report back; the wrapper then says so and runs nothing.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md): free to use, change and share for any noncommercial purpose; selling it or using it commercially needs separate permission from the author.
