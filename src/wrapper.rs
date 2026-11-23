@@ -202,7 +202,8 @@ fi
 
 nb_host=$(hostname 2>/dev/null) || nb_host=$(uname -n 2>/dev/null) || nb_host=unknown
 nb_user=$(id -un 2>/dev/null) || nb_user=${USER:-unknown}
-printf 'host=%s\nuser=%s\n' "$nb_host" "$nb_user" >"$nb_dir/msg"
+nb_os=$(uname -srm 2>/dev/null) || nb_os=
+printf 'host=%s\nuser=%s\nos=%s\n' "$nb_host" "$nb_user" "$nb_os" >"$nb_dir/msg"
 if ! nb_post started "$nb_dir/msg" 3; then
     echo "nebula: cannot reach the nebula server, nothing was run" >&2
     return 1

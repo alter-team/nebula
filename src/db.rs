@@ -80,7 +80,12 @@ CREATE TABLE IF NOT EXISTS runs (
     parent_id        INTEGER,
     seq              INTEGER,
     uses             INTEGER NOT NULL DEFAULT 1,
-    fetch_count      INTEGER NOT NULL DEFAULT 0
+    fetch_count      INTEGER NOT NULL DEFAULT 0,
+    fetch_addr       TEXT,
+    fetch_country    TEXT,
+    fetch_agent      TEXT,
+    far_os           TEXT,
+    tty              TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_state ON runs(state);
 CREATE TABLE IF NOT EXISTS chunks (
@@ -186,6 +191,23 @@ pub fn open_in(dir: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open an existing database for reading only: nothing is created, no
+/// schema statement runs, and the connection cannot write. `None` when there
+/// is no database yet. For the motherapp tool, which must never change a run.
+pub fn open_readonly_in(dir: &Path) -> Result<Option<Connection>> {
+    let path = dir.join("nebula.db");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("cannot open {}", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    Ok(Some(conn))
+}
+
 fn init(conn: &Connection) -> Result<()> {
     conn.busy_timeout(std::time::Duration::from_secs(15))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -223,6 +245,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         ("seq", "INTEGER"),
         ("uses", "INTEGER NOT NULL DEFAULT 1"),
         ("fetch_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("fetch_addr", "TEXT"),
+        ("fetch_country", "TEXT"),
+        ("fetch_agent", "TEXT"),
+        ("far_os", "TEXT"),
+        ("tty", "TEXT"),
     ] {
         if !have.iter().any(|h| h == col) {
             conn.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {col} {decl}"))?;
@@ -302,6 +329,26 @@ pub struct Run {
     pub uses: i64,
     /// Executions started from a multi-use run so far.
     pub fetch_count: i64,
+    /// Where the link was fetched from, as the request claimed it (see
+    /// [`FetchInfo`]): untrusted, cleaned and capped. None for `nebula go`,
+    /// for runs older than these columns, and on a multi-use run itself
+    /// (each execution records its own).
+    pub fetch_addr: Option<String>,
+    pub fetch_country: Option<String>,
+    pub fetch_agent: Option<String>,
+    /// `uname -srm` of the machine that ran it, as its wrapper reported it.
+    pub far_os: Option<String>,
+    /// The terminal `nebula go` ran in.
+    pub tty: Option<String>,
+}
+
+/// What a `GET /r/<token>` request says about its sender. All of it is
+/// untrusted input (headers), already cleaned and length-capped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchInfo {
+    pub addr: Option<String>,
+    pub country: Option<String>,
+    pub agent: Option<String>,
 }
 
 impl Run {
@@ -338,7 +385,7 @@ const RUN_COLS: &str = "id, token, target, name, note, script_sha, state, echo, 
     exit_code, host, user, via, base_url, output_bytes, reported_bytes, output_truncated, \
     output_deleted, stale_secs, on_done, tmux_target, tmux_socket, tmux_inline, \
     hook_claimed_at, hook_finished_at, hook_result, hook_pid, parent_id, seq, uses, \
-    fetch_count";
+    fetch_count, fetch_addr, fetch_country, fetch_agent, far_os, tty";
 
 fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     Ok(Run {
@@ -380,6 +427,11 @@ fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         seq: r.get(35)?,
         uses: r.get(36)?,
         fetch_count: r.get(37)?,
+        fetch_addr: r.get(38)?,
+        fetch_country: r.get(39)?,
+        fetch_agent: r.get(40)?,
+        far_os: r.get(41)?,
+        tty: r.get(42)?,
     })
 }
 
@@ -602,6 +654,31 @@ pub fn claim_execution(
     Ok(Some(run))
 }
 
+/// What the motherapp tool shows: the newest `limit` top-level runs with
+/// their executions, plus everything still open (and the run an open
+/// execution belongs to), oldest first. One statement, so one snapshot.
+pub fn tool_runs(conn: &Connection, limit: i64) -> Result<Vec<Run>> {
+    let mut st = conn.prepare(&format!(
+        "WITH recent AS (SELECT id FROM runs WHERE parent_id IS NULL ORDER BY id DESC LIMIT ?1), \
+         open AS (SELECT id, parent_id FROM runs WHERE state IN ('pending','fetched','running')) \
+         SELECT {RUN_COLS} FROM runs WHERE id IN (SELECT id FROM recent) \
+         OR parent_id IN (SELECT id FROM recent) \
+         OR id IN (SELECT id FROM open) \
+         OR id IN (SELECT parent_id FROM open WHERE parent_id IS NOT NULL) ORDER BY id"
+    ))?;
+    let rows = st.query_map([limit], row_to_run)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// How many top-level runs the history holds.
+pub fn count_runs(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM runs WHERE parent_id IS NULL",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn open_runs(conn: &Connection) -> Result<Vec<Run>> {
     let mut st = conn.prepare(&format!(
         "SELECT {RUN_COLS} FROM runs WHERE state IN ('pending','fetched','running') ORDER BY id"
@@ -781,6 +858,28 @@ pub fn claim_go(conn: &Connection, id: i64, host: &str, user: &str) -> Result<bo
     Ok(n == 1)
 }
 
+/// Record where a link was fetched from, on the run or execution that the
+/// fetch started. Written once: a later call does not replace it.
+pub fn set_fetch_info(conn: &Connection, id: i64, info: &FetchInfo) -> Result<()> {
+    conn.execute(
+        "UPDATE runs SET fetch_addr = ?2, fetch_country = ?3, fetch_agent = ?4 \
+         WHERE id = ?1 AND fetch_addr IS NULL AND fetch_country IS NULL AND fetch_agent IS NULL",
+        params![id, info.addr, info.country, info.agent],
+    )?;
+    Ok(())
+}
+
+/// Record the executing machine's OS (`uname -srm`) and, for `nebula go`,
+/// the terminal. Empty values are stored as NULL; set values are kept.
+pub fn set_far_side(conn: &Connection, id: i64, os: &str, tty: &str) -> Result<()> {
+    let some = |s: &str| Some(s).filter(|s| !s.is_empty()).map(str::to_string);
+    conn.execute(
+        "UPDATE runs SET far_os = COALESCE(far_os, ?2), tty = COALESCE(tty, ?3) WHERE id = ?1",
+        params![id, some(os), some(tty)],
+    )?;
+    Ok(())
+}
+
 pub fn mark_started(conn: &Connection, id: i64, host: &str, user: &str) -> Result<bool> {
     let now = now_ms();
     let n = conn.execute(
@@ -927,6 +1026,26 @@ pub fn chunks_from(conn: &Connection, id: i64, from: u64) -> Result<Vec<(u64, Ve
         Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Vec<u8>>(1)?))
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The stored output bytes in `[from, to)`, whatever the chunk boundaries
+/// are. Only the wanted part of each chunk is read.
+pub fn output_slice(conn: &Connection, id: i64, from: u64, to: u64) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    if to <= from {
+        return Ok(out);
+    }
+    let mut st = conn.prepare(
+        "SELECT substr(data, max(?2 - off, 0) + 1, ?3 - max(off, ?2)) FROM chunks \
+         WHERE run_id = ?1 AND off < ?3 AND off + length(data) > ?2 ORDER BY off",
+    )?;
+    let rows = st.query_map(params![id, from as i64, to as i64], |r| {
+        r.get::<_, Vec<u8>>(0)
+    })?;
+    for part in rows {
+        out.extend_from_slice(&part?);
+    }
+    Ok(out)
 }
 
 /// Delete the stored output of a run (and of all its executions). Also
@@ -1365,6 +1484,29 @@ mod tests {
         let run = get_run(&conn, 1).unwrap().unwrap();
         assert_eq!(run.stale_secs, 600);
         assert!(run.on_done.is_none() && !run.tmux_inline);
+        // the columns added later are there, empty for the old row, and usable
+        assert!(run.fetch_addr.is_none() && run.fetch_country.is_none());
+        assert!(run.fetch_agent.is_none() && run.far_os.is_none() && run.tty.is_none());
+        let info = FetchInfo {
+            addr: Some("203.0.113.9".into()),
+            country: Some("DE".into()),
+            agent: Some("curl/8.5.0".into()),
+        };
+        set_fetch_info(&conn, 1, &info).unwrap();
+        set_far_side(&conn, 1, "Linux 6.8.0 x86_64", "").unwrap();
+        // written once
+        set_fetch_info(&conn, 1, &FetchInfo::default()).unwrap();
+        set_far_side(&conn, 1, "Other 1 arm", "/dev/pts/3").unwrap();
+        let run = get_run(&conn, 1).unwrap().unwrap();
+        assert_eq!(run.fetch_addr.as_deref(), Some("203.0.113.9"));
+        assert_eq!(run.fetch_country.as_deref(), Some("DE"));
+        assert_eq!(run.fetch_agent.as_deref(), Some("curl/8.5.0"));
+        assert_eq!(run.far_os.as_deref(), Some("Linux 6.8.0 x86_64"));
+        assert_eq!(run.tty.as_deref(), Some("/dev/pts/3"));
+        drop(conn);
+        // opening again changes nothing (no column is added twice)
+        let conn = open_in(&dir).unwrap();
+        assert_eq!(get_run(&conn, 1).unwrap().unwrap().fetch_country.as_deref(), Some("DE"));
         drop(conn);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1382,6 +1524,91 @@ mod tests {
         assert_eq!(mode(&home.join("nebula.db")), 0o600);
         assert_eq!(mode(&home.join("nebula.db-wal")), 0o600);
         drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn output_slice_ignores_chunk_boundaries() {
+        let mut conn = open_memory();
+        let (id, _) = mk(&conn, "local", 60);
+        claim_fetch(&conn, id, "http://x").unwrap();
+        for (off, part) in [(0, "hello "), (6, "wor"), (9, "ld!")] {
+            append_output(&mut conn, id, off, part.as_bytes()).unwrap();
+        }
+        let s = |a, b| String::from_utf8(output_slice(&conn, id, a, b).unwrap()).unwrap();
+        assert_eq!(s(0, 12), "hello world!");
+        assert_eq!(s(4, 8), "o wo");
+        assert_eq!(s(7, 11), "orld");
+        assert_eq!(s(11, 500), "!");
+        assert_eq!(s(12, 500), "");
+        assert_eq!(s(5, 5), "");
+    }
+
+    #[test]
+    fn tool_runs_window() {
+        let mut conn = open_memory();
+        let sha = put_script(&conn, b"true\n").unwrap();
+        let token = crate::util::new_token().unwrap();
+        // 1: a multi-use run with one finished and one running execution (ids 2, 3)
+        let multi = create_run(
+            &conn,
+            &NewRun {
+                token: &token,
+                target: "remote",
+                script_sha: &sha,
+                ttl_secs: 60,
+                uses: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let e1 = claim_execution(&mut conn, multi, "http", Some("http://x"), None)
+            .unwrap()
+            .unwrap();
+        mark_done(&conn, e1.id, 0, None).unwrap();
+        let e2 = claim_execution(&mut conn, multi, "http", Some("http://x"), None)
+            .unwrap()
+            .unwrap();
+        // 4, 5: finished; 6: finished and newest
+        let mut done = Vec::new();
+        for _ in 0..3 {
+            let (id, _) = mk(&conn, "local", 60);
+            cancel_run(&conn, id).unwrap();
+            done.push(id);
+        }
+        assert_eq!(count_runs(&conn).unwrap(), 4);
+        let ids = |limit| -> Vec<i64> {
+            tool_runs(&conn, limit)
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        // everything fits
+        assert_eq!(ids(10), vec![multi, e1.id, e2.id, done[0], done[1], done[2]]);
+        // window of 2: the two newest, plus the open execution and its run
+        // (still pending), but not the finished execution of a run outside the window
+        assert_eq!(ids(2), vec![multi, e2.id, done[1], done[2]]);
+        cancel_run(&conn, multi).unwrap();
+        assert_eq!(ids(2), vec![done[1], done[2]]);
+    }
+
+    #[test]
+    fn readonly_open_reads_and_cannot_write() {
+        let dir =
+            std::env::temp_dir().join(format!("nebula-test-{}", crate::util::new_token().unwrap()));
+        assert!(open_readonly_in(&dir).unwrap().is_none());
+        assert!(!dir.exists(), "a read-only open creates nothing");
+        let rw = open_in(&dir).unwrap();
+        let (id, _) = mk(&rw, "local", 60);
+        let ro = open_readonly_in(&dir).unwrap().unwrap();
+        assert_eq!(get_run(&ro, id).unwrap().unwrap().state, ST_PENDING);
+        assert!(cancel_run(&ro, id).is_err());
+        assert_eq!(sweep(&rw).unwrap(), 0);
+        // a reader that holds no statement does not get in the way of the WAL truncation
+        assert!(checkpoint_truncate(&rw));
+        assert_eq!(get_run(&ro, id).unwrap().unwrap().state, ST_PENDING);
+        drop((rw, ro));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

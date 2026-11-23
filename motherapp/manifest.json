@@ -1,0 +1,16 @@
+{
+  "id": "nebula",
+  "title": "Nebula",
+  "icon": "🌌",
+  "serve": ["nebula", "motherapp", "serve"],
+  "page": "page.ts",
+  "defaultEnabled": true,
+  "wide": true,
+  "localActions": ["view", "oneLiner"],
+  "notifications": [
+    { "id": "finished", "label": "A run finished", "sound": "complete" },
+    { "id": "failed", "label": "A run failed (exit code not 0)", "sound": "dialog-warning" },
+    { "id": "lost", "label": "A run was lost", "sound": "dialog-warning" },
+    { "id": "expired", "label": "A link expired unused", "sound": "none" }
+  ]
+}

@@ -110,6 +110,44 @@ fn came_through_proxy(h: &HeaderMap) -> bool {
         || h.contains_key("x-forwarded-for")
 }
 
+/// Longest User-Agent / OS text kept.
+pub const MAX_INFO_CHARS: usize = 120;
+
+/// A header's value as text; bytes that are not UTF-8 are replaced, and
+/// every user of it cleans or parses the result.
+fn header_text(h: &HeaderMap, name: &str) -> Option<String> {
+    h.get(name)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+}
+
+/// Who fetched a link, as far as the request says. Through the tunnel the
+/// socket peer is always cloudflared on 127.0.0.1, so the address comes from
+/// `CF-Connecting-IP`, else the first `X-Forwarded-For` entry, else the
+/// peer. An address is kept only if it parses as an IP address, the country
+/// only as two letters or digits, the User-Agent as capped printable ASCII.
+/// None of it is proof: a local process can send any header it likes.
+pub fn fetch_info(h: &HeaderMap, peer: Option<std::net::IpAddr>) -> db::FetchInfo {
+    let ip = |s: &str| s.trim().parse::<std::net::IpAddr>().ok();
+    let addr = header_text(h, "cf-connecting-ip")
+        .and_then(|v| ip(&v))
+        .or_else(|| {
+            header_text(h, "x-forwarded-for").and_then(|v| v.split(',').next().and_then(ip))
+        })
+        .or(peer)
+        .map(|a| a.to_string());
+    let country = header_text(h, "cf-ipcountry")
+        .map(|c| c.trim().to_ascii_uppercase())
+        .filter(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_alphanumeric()));
+    let agent = header_text(h, "user-agent")
+        .map(|a| crate::util::clean_ascii(&a, MAX_INFO_CHARS))
+        .filter(|a| !a.is_empty());
+    db::FetchInfo {
+        addr,
+        country,
+        agent,
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Fetched {
     Wrapper(Vec<u8>),
@@ -120,7 +158,21 @@ pub enum Fetched {
 }
 
 /// `GET /r/<token>`: single use, pending only, before the TTL.
+#[cfg(test)]
 pub fn do_fetch(conn: &mut Connection, token: &str, via_proxy: bool, port: u16) -> Result<Fetched> {
+    do_fetch_from(conn, token, via_proxy, port, &db::FetchInfo::default())
+}
+
+/// [`do_fetch`], recording `from` on the run or execution the fetch starts.
+/// `from` never decides anything: which requests get the wrapper is the same
+/// with or without it.
+pub fn do_fetch_from(
+    conn: &mut Connection,
+    token: &str,
+    via_proxy: bool,
+    port: u16,
+    from: &db::FetchInfo,
+) -> Result<Fetched> {
     let Some(run) = db::get_run_by_token(conn, token)? else {
         return Ok(Fetched::NotFound);
     };
@@ -162,17 +214,21 @@ pub fn do_fetch(conn: &mut Connection, token: &str, via_proxy: bool, port: u16) 
     // The wrapper reports to the token of what it executes: the run itself,
     // or, for a multi-use link, a fresh execution with its own token, so one
     // execution can never post into another's output.
-    let (exec_token, label) = if run.is_multi() {
+    let (exec_id, exec_token, label) = if run.is_multi() {
         match db::claim_execution(conn, run.id, "http", Some(&origin), None)? {
-            Some(exec) => (exec.token.clone(), exec.label()),
+            Some(exec) => (exec.id, exec.token.clone(), exec.label()),
             None => return Ok(Fetched::NotFound),
         }
     } else {
         if !db::claim_fetch(conn, run.id, &origin)? {
             return Ok(Fetched::NotFound);
         }
-        (run.token.clone(), run.label())
+        (run.id, run.token.clone(), run.label())
     };
+    // Bookkeeping only; a failure here must not cost the fetch its wrapper.
+    if let Err(e) = db::set_fetch_info(conn, exec_id, from) {
+        eprintln!("nebula daemon: run {label}: could not record the fetch address: {e:#}");
+    }
     eprintln!("nebula daemon: run {label} fetched");
     let base = format!("{origin}/r/{exec_token}");
     Ok(Fetched::Wrapper(wrapper::generate(
@@ -230,7 +286,13 @@ pub fn do_post(
             let text = String::from_utf8_lossy(body);
             let host = clean_label(body_field(&text, "host").unwrap_or(""));
             let user = clean_label(body_field(&text, "user").unwrap_or(""));
-            ok(db::mark_started(conn, run.id, &host, &user)?)
+            // optional: wrappers from before this field do not send it
+            let os = crate::util::clean_ascii(body_field(&text, "os").unwrap_or(""), MAX_INFO_CHARS);
+            let started = db::mark_started(conn, run.id, &host, &user)?;
+            if started && !os.is_empty() {
+                db::set_far_side(conn, run.id, &os, "")?;
+            }
+            ok(started)
         }
         Action::Out => {
             let Some(off) = offset else {
@@ -280,11 +342,15 @@ fn empty(status: u16) -> Resp {
     reply(status, None, Vec::new())
 }
 
-async fn handle(app: Arc<App>, req: Request<Incoming>) -> Result<Resp, Infallible> {
-    Ok(respond(app, req).await)
+async fn handle(
+    app: Arc<App>,
+    peer: Option<std::net::IpAddr>,
+    req: Request<Incoming>,
+) -> Result<Resp, Infallible> {
+    Ok(respond(app, peer, req).await)
 }
 
-async fn respond(app: Arc<App>, req: Request<Incoming>) -> Resp {
+async fn respond(app: Arc<App>, peer: Option<std::net::IpAddr>, req: Request<Incoming>) -> Resp {
     let (parts, body) = req.into_parts();
     let Some(route) = parse_route(&parts.method, parts.uri.path()) else {
         return empty(404);
@@ -294,9 +360,11 @@ async fn respond(app: Arc<App>, req: Request<Incoming>) -> Resp {
     let via_proxy = came_through_proxy(&parts.headers);
 
     if action == Action::Fetch {
+        // read from headers hyper has already parsed and bounded; nothing more is read for it
+        let from = fetch_info(&parts.headers, peer);
         let res = tokio::task::spawn_blocking(move || {
             let mut conn = app.db.lock().unwrap_or_else(|e| e.into_inner());
-            do_fetch(&mut conn, &token, via_proxy, app.port)
+            do_fetch_from(&mut conn, &token, via_proxy, app.port, &from)
         })
         .await;
         return match res {
@@ -412,7 +480,8 @@ async fn serve_connection(app: Arc<App>, stream: tokio::net::TcpStream) {
         Ok(Ok(n)) if n > 0 => {}
         _ => return, // idle, closed, or failed: drop it
     }
-    let service = hyper::service::service_fn(move |req| handle(app.clone(), req));
+    let peer = stream.peer_addr().ok().map(|a| a.ip());
+    let service = hyper::service::service_fn(move |req| handle(app.clone(), peer, req));
     let conn = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_TIMEOUT)
@@ -867,6 +936,147 @@ mod tests {
         let start = w.find("NB_BASE='").unwrap() + 9;
         let base = &w[start..start + w[start..].find('\'').unwrap()];
         base.rsplit('/').next().unwrap().to_string()
+    }
+
+    fn headers(pairs: &[(&'static str, &[u8])]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            // a header value cannot hold control characters at all, so there is nothing to test
+            if let Ok(v) = hyper::header::HeaderValue::from_bytes(v) {
+                h.insert(*k, v);
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn fetch_info_from_headers() {
+        let peer = Some("127.0.0.1".parse().unwrap());
+        let info = |pairs: &[(&'static str, &[u8])]| fetch_info(&headers(pairs), peer);
+        let some = |s: &str| Some(s.to_string());
+        // nothing but the socket: the peer
+        assert_eq!(
+            info(&[]),
+            db::FetchInfo {
+                addr: some("127.0.0.1"),
+                country: None,
+                agent: None
+            }
+        );
+        assert_eq!(fetch_info(&HeaderMap::new(), None), db::FetchInfo::default());
+        // through cloudflared
+        assert_eq!(
+            info(&[
+                ("cf-connecting-ip", b"203.0.113.9"),
+                ("x-forwarded-for", b"198.51.100.1, 10.0.0.1"),
+                ("cf-ipcountry", b"de"),
+                ("user-agent", b"curl/8.5.0"),
+            ]),
+            db::FetchInfo {
+                addr: some("203.0.113.9"),
+                country: some("DE"),
+                agent: some("curl/8.5.0")
+            }
+        );
+        // another proxy: the first forwarded entry; IPv6 is normalised
+        assert_eq!(
+            info(&[("x-forwarded-for", b" 2001:DB8::0:1 , 10.0.0.1")]).addr,
+            some("2001:db8::1")
+        );
+        // anything that is not an address is not stored: the next source is used
+        for bad in [
+            &b"203.0.113.9; rm -rf /"[..],
+            b"<script>",
+            b"999.1.1.1",
+            b"",
+            b"203.0.113.9\x1b[31m",
+            b"\xff\xfe",
+        ] {
+            assert_eq!(info(&[("cf-connecting-ip", bad)]).addr, some("127.0.0.1"), "{bad:?}");
+            assert_eq!(
+                info(&[("cf-connecting-ip", bad), ("x-forwarded-for", b"198.51.100.1")]).addr,
+                some("198.51.100.1")
+            );
+            assert_eq!(info(&[("x-forwarded-for", bad)]).addr, some("127.0.0.1"));
+        }
+        for bad in [&b"DEU"[..], b"D", b"", b"D\x1b", b"<>", b"\xc3\xa9"] {
+            assert_eq!(info(&[("cf-ipcountry", bad)]).country, None, "{bad:?}");
+        }
+        assert_eq!(info(&[("cf-ipcountry", b"T1")]).country, some("T1"));
+        // the User-Agent: printable ASCII, capped
+        let long = [b'A'; 5000];
+        assert_eq!(info(&[("user-agent", &long)]).agent.unwrap().len(), MAX_INFO_CHARS);
+        assert_eq!(
+            info(&[("user-agent", b"Wget/1.21.4\xff\xc3\xa9[2J  \t<b>x</b>")]).agent,
+            some("Wget/1.21.4[2J <b>x</b>")
+        );
+        assert_eq!(info(&[("user-agent", b"\xff\xfe")]).agent, None);
+        assert_eq!(info(&[("user-agent", b"   ")]).agent, None);
+    }
+
+    #[test]
+    fn fetch_address_and_os_are_recorded_per_execution() {
+        let mut conn = db::open_memory();
+        let from = |n: u8| db::FetchInfo {
+            addr: Some(format!("203.0.113.{n}")),
+            country: Some("NL".into()),
+            agent: Some(format!("curl/8.{n}")),
+        };
+        // a single-use run
+        let (id, token) = mk(&conn, "remote", 60);
+        db::set_kv(&conn, "tunnel_state", db::TUNNEL_UP).unwrap();
+        db::set_kv(&conn, "tunnel_url", "https://t.example").unwrap();
+        assert!(matches!(
+            do_fetch_from(&mut conn, &token, true, 7411, &from(1)).unwrap(),
+            Fetched::Wrapper(_)
+        ));
+        // a second fetch is refused as before and changes nothing
+        assert_eq!(
+            do_fetch_from(&mut conn, &token, true, 7411, &from(2)).unwrap(),
+            Fetched::NotFound
+        );
+        let r = db::get_run(&conn, id).unwrap().unwrap();
+        assert_eq!(r.fetch_addr.as_deref(), Some("203.0.113.1"));
+        assert_eq!(r.fetch_country.as_deref(), Some("NL"));
+        assert_eq!(r.fetch_agent.as_deref(), Some("curl/8.1"));
+        assert!(r.far_os.is_none());
+        // the wrapper's "started" report carries the OS; it is cleaned and capped
+        let body = format!("host=web-1\nuser=root\nos=Linux 6.8.0\x1b[31m  x86_64{}\n", "y".repeat(500));
+        assert_eq!(
+            do_post(&mut conn, &token, Action::Started, true, None, body.as_bytes()).unwrap().0,
+            200
+        );
+        let r = db::get_run(&conn, id).unwrap().unwrap();
+        let os = r.far_os.unwrap();
+        assert!(os.starts_with("Linux 6.8.0[31m x86_64y") && os.len() == MAX_INFO_CHARS, "{os}");
+        // an old wrapper sends no os: still started, nothing stored
+        let (old, old_token) = mk(&conn, "remote", 60);
+        do_fetch(&mut conn, &old_token, true, 7411).unwrap();
+        assert_eq!(
+            do_post(&mut conn, &old_token, Action::Started, true, None, b"host=h\nuser=u\n").unwrap().0,
+            200
+        );
+        let r = db::get_run(&conn, old).unwrap().unwrap();
+        assert_eq!(r.state, db::ST_RUNNING);
+        assert!(r.far_os.is_none() && r.fetch_addr.is_none());
+
+        // a multi-use link: each execution has its own values, the run itself none
+        let (multi, mtoken) = mk_multi(&conn, "remote", 2, 60);
+        let mut execs = Vec::new();
+        for n in [7, 8] {
+            let w = wrapper_text(do_fetch_from(&mut conn, &mtoken, true, 7411, &from(n)).unwrap());
+            let t = exec_token(&w);
+            let os = format!("host=h{n}\nuser=u\nos=Linux 6.{n} arm64\n");
+            do_post(&mut conn, &t, Action::Started, true, None, os.as_bytes()).unwrap();
+            execs.push(db::get_run_by_token(&conn, &t).unwrap().unwrap());
+        }
+        assert_eq!(execs[0].fetch_addr.as_deref(), Some("203.0.113.7"));
+        assert_eq!(execs[1].fetch_addr.as_deref(), Some("203.0.113.8"));
+        assert_eq!(execs[0].far_os.as_deref(), Some("Linux 6.7 arm64"));
+        assert_eq!(execs[1].far_os.as_deref(), Some("Linux 6.8 arm64"));
+        assert_eq!(execs[1].fetch_agent.as_deref(), Some("curl/8.8"));
+        let parent = db::get_run(&conn, multi).unwrap().unwrap();
+        assert!(parent.fetch_addr.is_none() && parent.far_os.is_none());
     }
 
     #[test]

@@ -166,6 +166,9 @@ eq "nebula output" "$(printf 'hello from %s\nto stderr\n' "$(id -un)")" "$("$NEB
 "$NEBULA" show "$RUN_ID" >"$WORK/show.out"
 has "show has state" "$WORK/show.out" '^state: +done$'
 has "show has script body" "$WORK/show.out" '^echo "to stderr" >&2$'
+has "show has the far side's OS" "$WORK/show.out" "^os: +$(uname -srm)\$"
+has "show has the fetching address" "$WORK/show.out" '^fetched from: +127\.0\.0\.1$'
+has "show has the fetching client" "$WORK/show.out" '^fetched with: +curl/[0-9]'
 "$NEBULA" list >"$WORK/list.out"
 has "list shows the run" "$WORK/list.out" "^ +$RUN_ID +local +done +0 "
 
@@ -182,6 +185,9 @@ finish
 eq "nebula run exit code 7" 7 "$RUN_RC"
 has "output captured" "$RUN_OUT" '^before$'
 has "summary line" "$RUN_OUT" "^nebula: run $RUN_ID finished exit=7 bytes=7 "
+"$NEBULA" show "$RUN_ID" >"$WORK/show.out"
+has "wget: fetching client recorded" "$WORK/show.out" '^fetched with: +[Ww]get'
+has "wget: OS recorded" "$WORK/show.out" "^os: +$(uname -srm)\$"
 eq "second GET is 404 (single use)" 404 "$(http_code "$RUN_URL")"
 
 if command -v busybox >/dev/null 2>&1; then
@@ -207,6 +213,9 @@ EOF
     has "no curl in that environment" "$RUN_OUT" '^no curl$'
     has "output captured" "$RUN_OUT" '^line 2$'
     has "far side done line" "$WORK/far.err" "^nebula: run $RUN_ID done exit=4 "
+    "$NEBULA" show "$RUN_ID" >"$WORK/show.out"
+    has "busybox: OS recorded (busybox uname)" "$WORK/show.out" "^os: +$(uname -srm)\$"
+    has "busybox: fetching client recorded" "$WORK/show.out" '^fetched with: +[Ww]get'
     eq "no temp files left" 0 "$(find "$TMPDIR" -mindepth 1 | wc -l)"
 
     # multi-chunk under busybox too
@@ -278,6 +287,10 @@ has "go shows stderr too" "$WORK/go.out" '^go stderr$'
 has "go passes the terminal's stdin" "$WORK/go.out" '^stdin gave: typed-by-human$'
 has "go output recorded" "$RUN_OUT" '^stdin gave: typed-by-human$'
 has "summary line" "$RUN_OUT" "^nebula: run $RUN_ID finished exit=5 bytes=[0-9]+ host=$(hostname)\$"
+"$NEBULA" show "$RUN_ID" >"$WORK/show.out"
+has "go: OS recorded" "$WORK/show.out" "^os: +$(uname -sr) "
+has "go: no terminal on a pipe" "$WORK/show.out" '^terminal: +-$'
+hasnt "go: no fetch address" "$WORK/show.out" '^fetched '
 hasnt "no 'fetched' for a go run" "$RUN_OUT" 'fetched'
 eq "recorded via go" go "$(sql "select via from runs where id=$RUN_ID")"
 "$NEBULA" go "$RUN_ID" >/dev/null 2>"$WORK/go2.err"
@@ -597,6 +610,29 @@ has "remote output" "$RUN_OUT" '^remote says hi$'
 sh -c "$ONE" >/dev/null 2>"$WORK/reuse.err"
 eq "used one-liner fails loudly, exit code 1" 1 $?
 has "used one-liner says why" "$WORK/reuse.err" 'nebula: could not download the script'
+# what a fetch through cloudflared carries is recorded, cleaned; it never decides anything
+NEBULA_HOME="$WORK/home2" "$NEBULA" run --remote --no-clipboard "$S" >"$RUN_OUT" 2>&1 &
+RUN_PID=$!
+wait_for 10 grep -q 'waiting for run' "$RUN_OUT"
+RID=$(sed -n 's/^nebula: run \([0-9]*\) .*registered.*/\1/p' "$RUN_OUT" | head -n1)
+URL=$(grep -o "http://127.0.0.1:$PORT2/r/[A-Za-z0-9_-]*" "$RUN_OUT" | head -n1)
+curl -fsS -H 'CF-Connecting-IP: 203.0.113.9' -H 'X-Forwarded-For: 198.51.100.7' -H 'CF-IPCountry: nl' \
+    -A "curl/9.9 <b>\$(id)</b>     $(printf 'x%.0s' $(seq 1 300))" "$URL" | sh >/dev/null 2>&1
+finish
+eq "fetch with proxy headers still runs (exit 3)" 3 "$RUN_RC"
+NEBULA_HOME="$WORK/home2" "$NEBULA" show "$RID" >"$WORK/show-from.out"
+has "address from CF-Connecting-IP, country upper-cased" "$WORK/show-from.out" '^fetched from: +203\.0\.113\.9 \(NL\)$'
+has "user agent kept as text, spaces collapsed" "$WORK/show-from.out" '^fetched with: +curl/9\.9 <b>\$\(id\)</b> x+$'
+[ "$(grep '^fetched with:' "$WORK/show-from.out" | wc -c)" -le 140 ] && ok "user agent is capped" || bad "user agent is capped"
+NEBULA_HOME="$WORK/home2" "$NEBULA" run --remote --no-clipboard "$S" >"$RUN_OUT" 2>&1 &
+RUN_PID=$!
+wait_for 10 grep -q 'waiting for run' "$RUN_OUT"
+RID=$(sed -n 's/^nebula: run \([0-9]*\) .*registered.*/\1/p' "$RUN_OUT" | head -n1)
+URL=$(grep -o "http://127.0.0.1:$PORT2/r/[A-Za-z0-9_-]*" "$RUN_OUT" | head -n1)
+curl -fsS -H 'CF-Connecting-IP: 1.2.3.4; rm -rf /' -H 'CF-IPCountry: <script>' "$URL" | sh >/dev/null 2>&1
+finish
+NEBULA_HOME="$WORK/home2" "$NEBULA" show "$RID" >"$WORK/show-from.out"
+has "a forged non-address is not stored (socket peer instead), nor a bad country" "$WORK/show-from.out" '^fetched from: +127\.0\.0\.1$'
 if command -v zsh >/dev/null 2>&1; then
     zsh -f -c "$ONE" >/dev/null 2>&1
     eq "one-liner pasted into zsh still parses (used link -> 1)" 1 $?
@@ -991,6 +1027,9 @@ EOF
     "$NEBULA" wait "$did" >"$WORK/detach-wait.out" 2>&1
     eq "nebula wait after the notice returns the exit code" 0 $?
     has "and the output" "$WORK/detach-wait.out" '^hello$'
+    # The notice is visible in the pane as soon as its text is typed; the hook runner then
+    # still presses Enter and records the result, and until then `show` says "still running".
+    wait_for 10 sh -c "'$NEBULA' show $did | grep -q '^hook: *fired .*tmux: sent'"
     "$NEBULA" show "$did" >"$WORK/show-tmux.out"
     has "show displays the tmux settings" "$WORK/show-tmux.out" "^tmux notice: +pane $pane, socket $TS, inline result: no\$"
     has "show displays the sent notice" "$WORK/show-tmux.out" "^hook: +fired .*tmux: sent \[nebula: done #$did exit:0\]"

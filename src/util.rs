@@ -213,6 +213,48 @@ pub fn clean_label(s: &str) -> String {
         .to_string()
 }
 
+/// A short free-text value from the other side (a User-Agent, `uname`
+/// output): printable ASCII only, runs of spaces collapsed, at most `max`
+/// characters. Everything else is dropped, so it can be printed anywhere.
+pub fn clean_ascii(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        let c = if c == '\t' { ' ' } else { c };
+        if !(' '..='~').contains(&c) || (c == ' ' && (out.is_empty() || out.ends_with(' '))) {
+            continue;
+        }
+        if out.len() >= max {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim_end().to_string()
+}
+
+/// The terminal on stdin (`/dev/pts/3`), if there is one.
+pub fn stdin_tty() -> Option<String> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let link = std::fs::read_link("/proc/self/fd/0").ok()?;
+    let name = clean_ascii(&link.to_string_lossy(), 64);
+    name.starts_with("/dev/").then_some(name)
+}
+
+/// This machine's `uname -srm`, from /proc (no process is started).
+pub fn local_os() -> String {
+    let read = |f: &str| {
+        std::fs::read_to_string(format!("/proc/sys/kernel/{f}"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
+    clean_ascii(
+        &format!("{} {} {}", read("ostype"), read("osrelease"), std::env::consts::ARCH),
+        120,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +315,19 @@ mod tests {
                 .unwrap_or(true);
             assert!(gone, "child {k} survived");
         }
+    }
+
+    #[test]
+    fn ascii_cleaning() {
+        assert_eq!(clean_ascii("curl/8.5.0", 120), "curl/8.5.0");
+        assert_eq!(clean_ascii("  Wget/1.21.4 \t (linux-gnu)  ", 120), "Wget/1.21.4 (linux-gnu)");
+        assert_eq!(clean_ascii("a\x1b[31mb\r\nc\u{202e}d\0é", 120), "a[31mbcd");
+        assert_eq!(clean_ascii(&"x".repeat(500), 120).len(), 120);
+        assert_eq!(clean_ascii("ab   ", 3), "ab");
+        assert_eq!(clean_ascii("", 10), "");
+        assert_eq!(clean_ascii("\u{1F600}\n", 10), "");
+        let os = local_os();
+        assert!(os.starts_with("Linux ") && os.split(' ').count() == 3, "{os}");
     }
 
     #[test]

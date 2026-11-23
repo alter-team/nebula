@@ -32,6 +32,7 @@ One binary, three roles: `nebula daemon` (systemd user service), the CLI the age
 - A download that is cut off executes nothing (the wrapper is one function, called on its last line), and the wrapper refuses to run if the script's sha256 does not match.
 - Output is capped at 50 MB per run; request bodies are capped (8 MiB per output request, 4 KiB for the others). The wrapper uploads output in chunks of 256 KiB and halves the chunk after every failed post, down to 16 KiB, so a slow link (tested at 6 KiB/s) still delivers everything.
 - **The listener is defensive**, because the internet can reach it: a request for an unknown, finished or not-yet-fetched run is answered 404 before any of its body is read; at most 4 output uploads are buffered at a time (32 MiB); a connection must send its first byte within 3 s and its complete request head within 5 s; a body must arrive within 60 s and, after the first 5 s, at an average of at least 8 KiB/s (a trickling upload is dropped with 408 instead of holding an upload slot); a connection serves one request and lives at most 100 s; at most 128 connections are open at once. These limits stop slow or idle clients from the internet. **Known local-only limit:** a process on this machine that keeps opening idle connections (128 of them, re-opened every few seconds) or slow uploads can keep the listener busy and delay or block real runs. This cannot be done through the tunnel (cloudflared holds its own few connections to the listener); it needs code running locally as some user, which could do worse anyway, so it is accepted and not defended against.
+- **Where a link was fetched from is recorded, not verified.** For every fetch the daemon stores, on the run (or on that execution of a `--uses N` run), the address, the country and the User-Agent of the request. Through the tunnel the listener itself only ever sees cloudflared on `127.0.0.1`, so the address is taken from the `CF-Connecting-IP` header, else the first entry of `X-Forwarded-For`, else the socket peer; the country is `CF-IPCountry`. The far-side wrapper adds the output of `uname -srm` to its "started" report. All of this is input from the other side: a value is stored only if it parses as an IP address (address), is two letters or digits (country), or after being reduced to at most 120 printable ASCII characters (User-Agent, OS). **Any process on this machine can send these headers to the listener itself and so record any address it likes**, and the far side can report any OS; through the tunnel Cloudflare sets `CF-Connecting-IP` itself. Treat the fields as a hint about where a script went, never as proof, and note that they are personal data kept in the database until `nebula rm`. They decide nothing: which requests get a script and which a 404 is exactly as before, and nothing more is read from a request for them.
 - **Inlined results are untrusted.** With `--tmux-inline` a short output line from the far side is typed into the agent's tmux pane (which may be a shell prompt). Escape sequences are removed and then every character outside a fixed ASCII allow-list (letters, digits, space, `. , : - _ / = + %`) is replaced by `_`, with runs collapsed. The same is done to the run's name. So the typed line contains no `$`, backtick, quote, backslash, `!`, `;`, `&`, `|`, `<>`, `()`, `{}`, `*?`, `~`, `@`, `#`, bracket or any non-ASCII character from the run; the fixed parts are only `[nebula:`, the state, `#<id>`, `exit:<n>`, `result` and the two pairs of quotes around name and result. Typed at an idle zsh (also `zsh -f`), bash or dash prompt such a line executes nothing (at worst "command not found" or "bad pattern"); the e2e test checks this in real panes. The *words* still come from the other machine, and an agent must treat them as data. The inlined text is never stored: the run records `result <N bytes inlined>` instead.
 
 ## Install
@@ -93,10 +94,11 @@ nebula wait <id> [--timeout SECS]     re-attach to a run and block until it fini
 nebula output <id>                    complete raw output
 nebula status                         daemon, port, tunnel address, open runs
 nebula list [-n N]                    recent runs
-nebula show <id>                      metadata and script
+nebula show <id>                      metadata (also where it was fetched from and the far side's OS) and script
 nebula cancel <id>                    cancel a pending or running run
 nebula rm <id> [--output-only]        delete a finished run, or only its output
 nebula skill                          print the embedded SKILL.md
+nebula motherapp install|uninstall    show the runs in motherapp (see "In motherapp")
 ```
 
 `run` options: `--name`, `--note`, `--ttl SECS` (link lifetime, default 900), `--timeout SECS` (how long the command waits, default 3600; the run stays valid), `--echo`, `--delete-after`, `--no-clipboard`, `--max-print BYTES` (default 262144), `--stale-after SECS` (default 600, minimum 30, see "Lost runs"), `--uses N` (default 1, see below), and the completion options below.
@@ -135,6 +137,19 @@ Single use is the default and should stay the normal case. `--uses N` (1-1000, d
 - `nebula output 42.2`, `nebula wait 42.2`, `nebula show 42.2`, `nebula cancel 42.2`, `nebula rm 42.2` address one execution. `nebula output 42` refuses and lists the executions; `nebula show 42` lists them; `nebula cancel 42` closes the link and cancels the executions in progress; `nebula rm 42` removes the run with all executions.
 - With N=1 nothing changes: no executions, the run itself is fetched once.
 
+### What is recorded about where a run went
+
+`nebula show <id>` prints, besides host and user:
+
+```
+executed via: http
+os:           Linux 6.8.0-45-generic x86_64        uname -srm on the machine that ran it
+fetched from: 203.0.113.9 (NL)                     address and country of the request for the link
+fetched with: curl/8.5.0                           its User-Agent (curl, GNU Wget, BusyBox "Wget")
+```
+
+For a local `nebula go` run there is no fetch: it shows `os:` (this machine's, from `/proc`) and `terminal:` (`/dev/pts/3`, or `-` when stdin is no terminal). Runs recorded before these fields existed show `-`; an existing database gets the new columns the first time a newer `nebula` opens it. A wrapper fetched from an older daemon sends no OS, and an older daemon ignores the one a newer wrapper sends. These values are untrusted, see the security model above.
+
 ### Lost runs
 
 A run that was fetched but does not report "started" within 2 minutes, or that is running and has shown no sign of life (an output post, also one still uploading, or a heartbeat, which the wrapper sends after ~10 s without anything else) for `--stale-after` seconds (default 600, minimum 30 = 3x the heartbeat), is moved to the end state `lost`. `nebula run`/`wait` then exit 124 and hooks fire. Whatever output arrived stays readable. A lost run accepts no further posts; if the far side comes back later it keeps its output in a temp file and prints the path. The daemon checks every 2 seconds; without a daemon the waiting command does.
@@ -168,6 +183,27 @@ The daemon is built on `tokio` and `hyper` (not `axum`: its `serve` has no heade
 
 `nebula service install` copies whichever of these are set into the unit file.
 
+## In motherapp
+
+motherapp is a locally served control panel whose tools are separate processes. Nebula can be one of them: a page with the open runs and the history, each run's script and output (followed live while it runs), buttons to copy a pending run's one-liner, to cancel, and to delete a run or only its output, and a notification when a run finishes, fails, is lost, or its link expires unused.
+
+```sh
+nebula motherapp install      # writes manifest.json and page.ts to ~/.config/motherapp/tools/nebula/
+systemctl --user restart motherapp
+```
+
+`install` writes the absolute path of this executable into the manifest (so install the binary first, and run it again if the binary moves); if `NEBULA_HOME` is set it is passed on as `serve --home`. `--dir DIR` names another folder, `--dry-run` only prints. `nebula motherapp uninstall` removes the two files again. The sources of both files are in `motherapp/` and are embedded in the binary.
+
+motherapp starts `nebula motherapp serve` and talks to it over stdin/stdout (JSON-RPC 2.0, one message per line; it exits when stdin closes). What that process does and does not do:
+
+- **It only reads the database**, every 1.5 s, through a read-only connection with no statement left open between two polls, so it never delays a secure delete. It does not expire links, mark runs lost or fire hooks: that stays with the daemon and the CLI. Without a database it creates none.
+- **Cancel and delete go through the same code as `nebula cancel`, `nebula rm` and `nebula rm --output-only`**, with the same refusals and messages. The page asks before each.
+- **What it publishes is metadata only**: id, target, state, name, exit code, host, user, byte counts, timestamps, and whether the daemon runs and its tunnel is up. motherapp caches that and shows it to every browser it serves, also on the LAN if that is switched on there. **Output, script text, the note, the token, the tunnel address and the one-liner are never in it**, nor in a log line or a notification (a notification says "disk-check finished" or "#42 failed (exit 3)", nothing more). They are returned only by the actions `view` and `oneLiner`, which the manifest lists under `localActions`: motherapp refuses those for any browser that is not on this machine.
+- `view` returns output from a byte offset, at most 256 KiB per call (when there is more, the newest part; with `forward` the next part, which is how the page reads all of it), decoded as UTF-8 with invalid bytes replaced. `nebula output <id>` remains the way to get all of it, byte for byte.
+- **Where a link was fetched from (address, country, User-Agent), the far side's OS and the terminal are also only in `view`'s result**, shown in the run's details on this machine; they are never in the published state, a log line or a notification.
+- The page colours the script as POSIX shell (a small tokenizer in `motherapp/page.ts`; a script whose `#!` names python, perl, node and the like is shown plain) and shows the output's ANSI colours in the theme's own colours; other escape sequences are not displayed. Two small copy buttons: the script, and the **complete** output as plain text without escape sequences, fetched page by page whatever the box shows (of more than 8 MiB the newest 8 MiB, and the page says so).
+- The page shows the newest 100 runs plus everything still open. An execution of a `--uses N` run is listed under its run as `42.2`, with its own output.
+
 ## How it works
 
 The SQLite database is the only channel between the parts: the CLI inserts a run and polls it every 250 ms; the daemon serves and updates the same rows; `nebula go` writes to it directly. Several agents can use it at the same time, each run is independent.
@@ -181,7 +217,9 @@ A script is stored with a final newline (one is added if missing), so its bytes 
 ## Tests
 
 ```sh
-cargo test                 # unit tests + tests/e2e.sh on two free ports (temp NEBULA_HOME, no tunnel)
+cargo test                 # unit tests, tests/e2e.sh on two free ports (temp NEBULA_HOME, no tunnel),
+                           # tests/motherapp.rs (drives `nebula motherapp serve` over stdio), and
+                           # tests/page.rs (runs motherapp/page.test.mjs if a Node 22.6+ is found)
 tests/e2e.sh target/release/nebula
 ```
 

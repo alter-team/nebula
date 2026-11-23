@@ -151,6 +151,13 @@ pub fn run(reference: &str) -> Result<i32> {
         }
         (run.id, run.label())
     };
+    // what is known for free about where it runs; never worth failing over
+    let _ = db::set_far_side(
+        &conn,
+        id,
+        &util::local_os(),
+        util::stdin_tty().as_deref().unwrap_or(""),
+    );
     eprintln!("nebula: run {lbl} started");
 
     // Handlers go in before the script starts; exec resets them to default

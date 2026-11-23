@@ -153,7 +153,7 @@ fn resolve_tmux(arg: Option<&str>) -> Result<Option<(String, Option<String>)>> {
 }
 
 /// The one-liner for a pending run as of now (None: remote and no tunnel).
-fn current_one_liner(run: &Run, info: &DaemonInfo) -> Option<String> {
+pub fn current_one_liner(run: &Run, info: &DaemonInfo) -> Option<String> {
     if !run.is_remote() {
         return Some(format!("nebula go {}", run.id));
     }
@@ -1173,6 +1173,21 @@ pub fn cmd_show(reference: &str) -> Result<i32> {
     say(&format!("host:         {}", opt(&r.host)));
     say(&format!("user:         {}", opt(&r.user)));
     say(&format!("executed via: {}", opt(&r.via)));
+    say(&format!("os:           {}", opt(&r.far_os)));
+    if r.via.as_deref() == Some("go") {
+        say(&format!("terminal:     {}", opt(&r.tty)));
+    } else {
+        // as the request claimed it: headers can be forged by a local process
+        say(&format!(
+            "fetched from: {}{}",
+            opt(&r.fetch_addr),
+            r.fetch_country
+                .as_deref()
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default()
+        ));
+        say(&format!("fetched with: {}", opt(&r.fetch_agent)));
+    }
     say(&format!("created:      {}", fmt_time(r.created_at)));
     say(&format!(
         "link expires: {} (ttl {} s)",
@@ -1316,66 +1331,114 @@ pub fn cmd_output(reference: &str) -> Result<i32> {
     Ok(0)
 }
 
-pub fn cmd_cancel(reference: &str) -> Result<i32> {
-    let conn = db::open()?;
-    let Some(r) = db::resolve(&conn, reference)? else {
-        eprintln!("nebula: no run {reference}");
-        return Ok(exit::ERROR);
+/// What `cancel` or `rm` did: the exit code and the lines the command prints
+/// (stdout when the code is 0, stderr otherwise). Shared with the motherapp
+/// tool, whose actions must behave exactly as these commands do.
+pub struct Done {
+    pub code: i32,
+    pub lines: Vec<String>,
+}
+
+impl Done {
+    fn ok(lines: Vec<String>) -> Self {
+        Done { code: 0, lines }
+    }
+    fn refused(code: i32, line: String) -> Self {
+        Done {
+            code,
+            lines: vec![line],
+        }
+    }
+    fn print(self) -> i32 {
+        for line in &self.lines {
+            if self.code == 0 {
+                say(line);
+            } else {
+                eprintln!("{line}");
+            }
+        }
+        self.code
+    }
+}
+
+pub fn cancel(conn: &Connection, reference: &str) -> Result<Done> {
+    let Some(r) = db::resolve(conn, reference)? else {
+        return Ok(Done::refused(
+            exit::ERROR,
+            format!("nebula: no run {reference}"),
+        ));
     };
     let id = r.label();
-    if db::cancel_run(&conn, r.id)? {
-        hooks::fire_if_no_daemon(&conn);
-        say(&format!("nebula: run {id} cancelled (was {})", r.state));
+    if db::cancel_run(conn, r.id)? {
+        hooks::fire_if_no_daemon(conn);
+        let mut lines = vec![format!("nebula: run {id} cancelled (was {})", r.state)];
         if r.is_active() && r.via.as_deref() != Some("go") {
-            say(
+            lines.push(
                 "nebula: note: a script already running on the far side is NOT stopped; \
-                 its link and callbacks are dead and its result will be discarded",
+                 its link and callbacks are dead and its result will be discarded"
+                    .into(),
             );
         }
-        Ok(0)
+        Ok(Done::ok(lines))
     } else {
-        eprintln!("nebula: run {id} is already {}, nothing to cancel", r.state);
-        Ok(1)
+        Ok(Done::refused(
+            1,
+            format!("nebula: run {id} is already {}, nothing to cancel", r.state),
+        ))
+    }
+}
+
+pub fn cmd_cancel(reference: &str) -> Result<i32> {
+    let conn = db::open()?;
+    Ok(cancel(&conn, reference)?.print())
+}
+
+pub fn remove(conn: &mut Connection, reference: &str, output_only: bool) -> Result<Done> {
+    let Some(r) = db::resolve(conn, reference)? else {
+        return Ok(Done::refused(
+            exit::ERROR,
+            format!("nebula: no run {reference}"),
+        ));
+    };
+    let id = r.label();
+    let busy = db::executions(conn, r.id)?
+        .into_iter()
+        .find(|e| !e.is_finished());
+    if let Some(e) = busy {
+        return Ok(Done::refused(
+            1,
+            format!(
+                "nebula: execution {} of run {id} is {}; cancel it first (nebula cancel {})",
+                e.label(),
+                e.state,
+                e.label()
+            ),
+        ));
+    }
+    if !r.is_finished() {
+        return Ok(Done::refused(
+            1,
+            format!(
+                "nebula: run {id} is {}; cancel it first (nebula cancel {id})",
+                r.state
+            ),
+        ));
+    }
+    if output_only {
+        db::delete_output(conn, r.id)?;
+        Ok(Done::ok(vec![format!(
+            "nebula: output of run {id} deleted ({} bytes); metadata kept",
+            r.output_bytes
+        )]))
+    } else {
+        db::delete_run(conn, r.id)?;
+        Ok(Done::ok(vec![format!("nebula: run {id} removed")]))
     }
 }
 
 pub fn cmd_rm(reference: &str, output_only: bool) -> Result<i32> {
     let mut conn = db::open()?;
-    let Some(r) = db::resolve(&conn, reference)? else {
-        eprintln!("nebula: no run {reference}");
-        return Ok(exit::ERROR);
-    };
-    let id = r.label();
-    let busy = db::executions(&conn, r.id)?
-        .into_iter()
-        .find(|e| !e.is_finished());
-    if let Some(e) = busy {
-        eprintln!(
-            "nebula: execution {} of run {id} is {}; cancel it first (nebula cancel {})",
-            e.label(),
-            e.state,
-            e.label()
-        );
-        return Ok(1);
-    }
-    if !r.is_finished() {
-        eprintln!(
-            "nebula: run {id} is {}; cancel it first (nebula cancel {id})",
-            r.state
-        );
-        return Ok(1);
-    }
-    if output_only {
-        db::delete_output(&mut conn, r.id)?;
-        say(&format!(
-            "nebula: output of run {id} deleted ({} bytes); metadata kept",
-            r.output_bytes
-        ));
-    } else {
-        db::delete_run(&mut conn, r.id)?;
-        say(&format!("nebula: run {id} removed"));
-    }
-    Ok(0)
+    Ok(remove(&mut conn, reference, output_only)?.print())
 }
 
 #[cfg(test)]

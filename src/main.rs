@@ -7,6 +7,7 @@ mod daemon;
 mod db;
 mod go;
 mod hooks;
+mod motherapp;
 mod service;
 mod tunnel;
 mod util;
@@ -172,6 +173,11 @@ enum Cmd {
         #[command(subcommand)]
         action: ServiceCmd,
     },
+    /// Show the runs and their output in motherapp (a locally served control panel)
+    Motherapp {
+        #[command(subcommand)]
+        action: MotherappCmd,
+    },
     /// Run the claimed completion hook of a run (internal)
     #[command(name = "hook-run", hide = true)]
     HookRun { id: i64 },
@@ -205,6 +211,35 @@ enum ServiceCmd {
     },
     /// Show the systemd status of the service
     Status,
+}
+
+#[derive(Subcommand)]
+enum MotherappCmd {
+    /// Write the tool's manifest.json and page.ts where motherapp finds them
+    /// (~/.config/motherapp/tools/nebula), pointing at this executable
+    Install {
+        /// The tool's folder, instead of $XDG_CONFIG_HOME/motherapp/tools/nebula
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+        /// Only print the manifest and the paths, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove the files `install` wrote
+    Uninstall {
+        /// The tool's folder, instead of $XDG_CONFIG_HOME/motherapp/tools/nebula
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+        /// Only print what would be done
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Serve mode: JSON-RPC on stdin/stdout, started by motherapp, not by hand
+    Serve {
+        /// Directory of nebula.db, instead of $NEBULA_HOME or the default
+        #[arg(long, value_name = "DIR")]
+        home: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() {
@@ -271,6 +306,11 @@ fn main() {
             ServiceCmd::Install { dry_run } => service::install(dry_run),
             ServiceCmd::Uninstall { dry_run } => service::uninstall(dry_run),
             ServiceCmd::Status => service::status(),
+        },
+        Cmd::Motherapp { action } => match action {
+            MotherappCmd::Install { dir, dry_run } => motherapp::install(dir, dry_run),
+            MotherappCmd::Uninstall { dir, dry_run } => motherapp::uninstall(dir, dry_run),
+            MotherappCmd::Serve { home } => motherapp::serve::run(home.as_deref()),
         },
         Cmd::ClipboardCheck => match clipboard::read_back() {
             Ok((text, how)) => {
